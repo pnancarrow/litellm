@@ -19853,6 +19853,58 @@ async def test_disabled_stdio_tools_are_empty_initially_and_reject_continuation(
 
 
 @pytest.mark.asyncio
+async def test_aggregate_times_out_paginated_server_without_dropping_healthy_tools(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mcp.types import ListToolsResult, PaginatedRequestParams
+
+    from litellm.proxy import proxy_server
+    from litellm.proxy._experimental.mcp_server import catalog, mcp_server_manager as manager_module, operations
+    from litellm.proxy._experimental.mcp_server.utils import MCP_TOOL_PREFIX_SEPARATOR, get_server_prefix
+
+    monkeypatch.setenv("LITELLM_SALT_KEY", "paginated-timeout-test")
+    monkeypatch.setattr(proxy_server, "prisma_client", None)
+    monkeypatch.setattr(manager_module, "MCP_TOOL_LISTING_TIMEOUT", 0.2)
+    healthy_tool: Final = MCPTool(name="echo", input_schema={"type": "object"})
+    servers: Final = (
+        MCPServer(server_id="healthy", name="healthy", transport=MCPTransport.http),
+        MCPServer(server_id="hung", name="hung", transport=MCPTransport.http),
+    )
+    manager: Final = MCPServerManager()
+    manager.registry = {server.server_id: server for server in servers}
+    healthy_client: Final = AsyncMock()
+    healthy_client._last_initialize_instructions = None
+    healthy_client.timeout = 60
+    healthy_client.list_tools_page.return_value = ListToolsResult(tools=[healthy_tool])
+    hung_client: Final = AsyncMock()
+    hung_client._last_initialize_instructions = None
+    hung_client.timeout = 60
+
+    async def wait_forever(_params: PaginatedRequestParams) -> ListToolsResult:
+        await asyncio.Event().wait()
+        return ListToolsResult(tools=[])
+
+    hung_client.list_tools_page.side_effect = wait_forever
+    clients: Final = {"healthy": healthy_client, "hung": hung_client}
+
+    async def create_client(server: MCPServer, **_kwargs: object) -> MCPClient:
+        return cast(MCPClient, clients[server.server_id])
+
+    manager.create_mcp_client = create_client
+    monkeypatch.setattr(operations, "global_mcp_server_manager", manager)
+    context: Final = operations.prepare_context(UserAPIKeyAuth(api_key="owned-caller", user_id="alice"))
+
+    async with asyncio.timeout(5):
+        listing: Final = await catalog.aggregate_gateway_tools(
+            context, PaginatedRequestParams(), servers, {}, record_listing=True, enforce_rate_limits=False
+        )
+
+    assert [tool.name for tool in listing.tools] == [f"{get_server_prefix(servers[0])}{MCP_TOOL_PREFIX_SEPARATOR}echo"]
+    assert listing.outcomes["hung"].tag == "timeout"
+    assert listing.outcomes["healthy"].tag == "ok"
+
+
+@pytest.mark.asyncio
 async def test_failed_aggregate_continuation_preserves_only_delivered_tool_metadata(monkeypatch):
     from mcp.shared.exceptions import MCPError
     from mcp.types import ListToolsResult, PaginatedRequestParams
