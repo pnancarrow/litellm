@@ -3,8 +3,8 @@
 A ``RedisBatch`` collects MGETs, Lua scripts and increments declared by unrelated callers and sends them
 in one ``pipeline(transaction=False)`` round trip. Every declaration returns an awaitable; awaiting one
 flushes whatever has been declared so far, so callers keep their existing ``await`` shape and their own
-error handling while sharing the wire. Redis Cluster clients run each operation on its own, as before:
-a cluster pipeline is per node anyway and the existing per-operation paths already group by slot.
+error handling while sharing the wire. On Redis Cluster the same pipeline is split per node by redis-py,
+so a flush costs one connection per node touched instead of one per operation.
 """
 
 from __future__ import annotations
@@ -50,7 +50,8 @@ class RegisteredScript(Protocol):
 
 class _RedisPipeline(Protocol):
     def mget(self, keys: Sequence[str]) -> object: ...
-    def evalsha(self, sha: str, numkeys: int, *keys_and_args: _ScriptArg) -> object: ...
+    def get(self, name: str) -> object: ...
+    def execute_command(self, *args: _ScriptArg) -> object: ...
     def incrbyfloat(self, name: str, amount: float) -> object: ...
     def expire(self, name: str, time: timedelta) -> object: ...
     def set(self, name: str, value: str, ex: timedelta | None = None) -> object: ...
@@ -60,8 +61,7 @@ class _RedisPipeline(Protocol):
 
 class _Op(Generic[_T]):
     """One declared operation: how many pipeline replies it consumes, how to turn them into a result, and
-    how to run on its own when the batch cannot pipeline (cluster client, or a reply the pipeline cannot
-    settle, like NOSCRIPT)."""
+    how to run on its own when the pipeline returns a reply it cannot settle, like NOSCRIPT."""
 
     __slots__ = ("caller", "future", "settled_hooks", "target")
 
@@ -115,6 +115,12 @@ class _Op(Generic[_T]):
             self.future.set_exception(e)
 
 
+def _reply_list(reply: object) -> Sequence[object]:
+    if not isinstance(reply, (list, tuple)):
+        raise TypeError(f"MGET reply is not a list: {type(reply).__name__}")
+    return reply
+
+
 def _is_missing_script(failure: Exception) -> bool:
     """Imported lazily: this module is reachable from a base ``import litellm`` while redis is not a base dependency."""
     from redis.exceptions import NoScriptError
@@ -129,24 +135,31 @@ def _mark_retrieved(future: asyncio.Future[object]) -> None:
 
 
 class _MGet(_Op[Mapping[str, object]]):
-    __slots__ = ("_keys", "_redis_cache")
+    __slots__ = ("_keys", "_per_key", "_redis_cache")
 
     def __init__(self, redis_cache: RedisCache, keys: Sequence[str]) -> None:
         super().__init__()
         self._redis_cache: Final = redis_cache
         self._keys: Final[tuple[str, ...]] = tuple(dict.fromkeys(keys))
+        self._per_key: Final = isinstance(redis_cache, RedisClusterCache)
 
     def enqueue(self, pipe: _RedisPipeline) -> int:
-        pipe.mget(tuple(self._redis_cache.check_and_fix_namespace(key=key) for key in self._keys))
-        return 1
+        names: Final = tuple(self._redis_cache.check_and_fix_namespace(key=key) for key in self._keys)
+        if not self._per_key:
+            pipe.mget(names)
+            return 1
+        for name in names:
+            pipe.get(name)
+        return len(names)
 
     def resolve(self, replies: Sequence[object]) -> Mapping[str, object]:
-        values: Final = replies[0]
-        if not isinstance(values, (list, tuple)):
-            raise TypeError(f"MGET reply is not a list: {type(values).__name__}")
-        return MappingProxyType(
-            {key: self._redis_cache._get_cache_logic(value) for key, value in zip(self._keys, values)}  # pyright: ignore[reportPrivateUsage, reportUnknownMemberType, reportUnknownArgumentType]  # shared decode with async_batch_get_cache
-        )
+        values: Final[Sequence[object]] = replies if self._per_key else _reply_list(replies[0])
+        return MappingProxyType({key: self._decode(value) for key, value in zip(self._keys, values)})
+
+    def _decode(self, value: object) -> object:
+        if value is not None and not isinstance(value, (bytes, str)):
+            raise TypeError(f"GET reply is not bytes: {type(value).__name__}")
+        return self._redis_cache._get_cache_logic(value)  # pyright: ignore[reportPrivateUsage]  # shared decode with async_batch_get_cache
 
     async def run_alone(self) -> Mapping[str, object]:
         found: Mapping[str, object] = await self._redis_cache.async_batch_get_cache(key_list=list(self._keys))  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]  # untyped cache API
@@ -175,7 +188,7 @@ class _Script(_Op[object]):
 
     def enqueue(self, pipe: _RedisPipeline) -> int:
         namespaced: Final = tuple(self._redis_cache.check_and_fix_namespace(key=key) for key in self._keys)
-        pipe.evalsha(self._sha, len(namespaced), *namespaced, *self._args)
+        pipe.execute_command("EVALSHA", self._sha, len(namespaced), *namespaced, *self._args)
         return 1
 
     def resolve(self, replies: Sequence[object]) -> object:
@@ -357,10 +370,7 @@ class RedisBatch:
                 return
             self.flushes += 1
             try:
-                if isinstance(self.redis_cache, RedisClusterCache):
-                    await asyncio.gather(*(op._settle_alone() for op in ops))  # pyright: ignore[reportPrivateUsage]  # batch owns its ops
-                else:
-                    await self._flush_pipeline(ops)
+                await self._flush_pipeline(ops)
             finally:
                 for op in ops:
                     if not op.future.done():
@@ -379,7 +389,11 @@ class RedisBatch:
                 return await pipe.execute(raise_on_error=False)
 
         try:
-            replies: Final = await _run_under_circuit_breaker(self.redis_cache._circuit_breaker, self.name, run)  # pyright: ignore[reportPrivateUsage]  # same breaker as the cache's own methods
+            replies: Final = await _run_under_circuit_breaker(
+                self.redis_cache._circuit_breaker,  # pyright: ignore[reportPrivateUsage]  # same breaker as the cache's own methods
+                self.name,
+                lambda: self.redis_cache._admit_async_call(run),  # pyright: ignore[reportPrivateUsage]  # same pool gate as the cache's own methods
+            )
         except Exception as e:  # noqa: BLE001  # each declaring caller applies its own Redis fallback
             log_redis_failure(verbose_logger, logging.WARNING, f"{self.name}: pipeline of {len(ops)} ops failed", e)
             with service_target(target):
